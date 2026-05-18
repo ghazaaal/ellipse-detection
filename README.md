@@ -7,3 +7,10 @@ g++ -O3 -std=c++17 ellipsesdetetction_visual_fixed.cpp -o dght_cpp   -I/usr/incl
 and run:
 
 ./dght_cpp --ann annotations.json --ellipses_dir Ellipses   --mode first --n 1000   --vis_dir vis_output --save_vis_n 20   --out_csv batch_results_all_1000.csv
+
+
+Build for 1000 : 
+./dght_cpp.exe --ann ellipse-detection-main/annotations.json --ellipses_dir Ellipses --mode first --n 1000 --vis_dir vis_output --save_vis_n 1000 --out_csv batch_results_all_1000.csv
+
+run for 1000 : 
+./dght_cpp.exe --ann ellipse-detection-main/annotations.json --ellipses_dir Ellipses --mode first --n 1000 --vis_dir vis_output --save_vis_n 1000 --out_csv batch_results_all_1000.csv
