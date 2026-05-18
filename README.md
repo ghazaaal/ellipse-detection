@@ -14,3 +14,8 @@ Build for 1000 :
 
 run for 1000 : 
 ./dght_cpp.exe --ann ellipse-detection-main/annotations.json --ellipses_dir Ellipses --mode first --n 1000 --vis_dir vis_output --save_vis_n 1000 --out_csv batch_results_all_1000.csv
+
+requriment for memory mesuremnet :
+ pacman -S time
+ run on 1000 and also memory mesured : 
+ /usr/bin/time -v ./dght_cpp.exe --ann ellipse-detection-main/annotations.json --ellipses_dir Ellipses --mode first --n 1000 --vis_dir vis_output --save_vis_n 1000 --out_csv batch_results_all_1000.csv
