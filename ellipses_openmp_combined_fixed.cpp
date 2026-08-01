@@ -553,6 +553,13 @@ static std::optional<EllipseParams> fit_ellipse_from_5_points(const std::array<c
     return ellipse_from_conic(*p);
 }
 
+static void merge_histograms(const std::vector<int>& src, std::vector<int>& dst) {
+    if (src.size() != dst.size()) return;
+    for (size_t i = 0; i < src.size(); ++i) {
+        dst[i] += src[i];
+    }
+}
+
 static std::pair<std::optional<EllipseParams>, DetectOneInfo> dght_detect_one_ellipse(
     const std::vector<cv::Point>& points_xy,
     int W,
@@ -596,14 +603,104 @@ static std::pair<std::optional<EllipseParams>, DetectOneInfo> dght_detect_one_el
     int th_bins = static_cast<int>(std::floor(M_PI / theta_step_rad));
 
     std::vector<int> Hcx(cx_bins, 0), Hcy(cy_bins, 0), Ha(a_bins, 0), Hb(b_bins, 0), Hth(th_bins, 0);
-    std::mt19937 rng(123);
-
-    int stable = 0;
-    std::optional<std::array<int, 5>> last_modes;
     int trials_done = 0;
     std::optional<EllipseParams> best_candidate;
     int best_inliers = -1;
 
+#ifdef _OPENMP
+    const int nthreads = (g_vote_threads > 0) ? g_vote_threads : omp_get_max_threads();
+    std::vector<std::vector<int>> local_Hcx(nthreads, std::vector<int>(cx_bins, 0));
+    std::vector<std::vector<int>> local_Hcy(nthreads, std::vector<int>(cy_bins, 0));
+    std::vector<std::vector<int>> local_Ha(nthreads, std::vector<int>(a_bins, 0));
+    std::vector<std::vector<int>> local_Hb(nthreads, std::vector<int>(b_bins, 0));
+    std::vector<std::vector<int>> local_Hth(nthreads, std::vector<int>(th_bins, 0));
+    std::vector<std::optional<EllipseParams>> local_best(nthreads);
+    std::vector<int> local_best_inliers(nthreads, -1);
+    std::vector<int> local_trials_done(nthreads, 0);
+
+#pragma omp parallel num_threads(nthreads)
+    {
+        const int tid = omp_get_thread_num();
+        auto& lcx = local_Hcx[tid];
+        auto& lcy = local_Hcy[tid];
+        auto& la = local_Ha[tid];
+        auto& lb = local_Hb[tid];
+        auto& lth = local_Hth[tid];
+        std::mt19937 rng(123 + tid * 17);
+
+#pragma omp for schedule(dynamic)
+        for (int t = 1; t <= max_trials; ++t) {
+            if (seg_pts.size() < 4) continue;
+            std::vector<int> indices(seg_pts.size());
+            std::iota(indices.begin(), indices.end(), 0);
+            std::shuffle(indices.begin(), indices.end(), rng);
+
+            std::array<cv::Point2d, 5> pts5 = {
+                cv::Point2d(seed->x, seed->y),
+                cv::Point2d(seg_pts[indices[0]].x, seg_pts[indices[0]].y),
+                cv::Point2d(seg_pts[indices[1]].x, seg_pts[indices[1]].y),
+                cv::Point2d(seg_pts[indices[2]].x, seg_pts[indices[2]].y),
+                cv::Point2d(seg_pts[indices[3]].x, seg_pts[indices[3]].y)
+            };
+
+            auto e_opt = fit_ellipse_from_5_points(pts5);
+            if (!e_opt) continue;
+            const auto& e = *e_opt;
+
+            if (!(0.0 <= e.cx && e.cx < W && 0.0 <= e.cy && e.cy < H)) continue;
+            if (e.a <= 0.0 || e.b <= 0.0) continue;
+
+            double ratio = (e.a > 0.0) ? (e.b / e.a) : 0.0;
+            if (ratio < ASPECT_RATIO_MIN || ratio > ASPECT_RATIO_MAX) continue;
+            if (e.a < a_min || e.a > a_max) continue;
+            if (e.b < b_min || e.b > b_max) continue;
+
+            auto inl = boundary_inliers(points_xy, e, boundary_tol);
+            int inl_cnt = std::accumulate(inl.begin(), inl.end(), 0);
+            if (inl_cnt > local_best_inliers[tid]) {
+                local_best_inliers[tid] = inl_cnt;
+                local_best[tid] = e;
+            }
+
+            if (inl_cnt < std::max(6, min_inliers_accept / 2)) continue;
+
+            int cxb = static_cast<int>(std::floor(e.cx / center_step));
+            int cyb = static_cast<int>(std::floor(e.cy / center_step));
+            int ab = static_cast<int>(std::floor((e.a - a_min) / a_step));
+            int bb = static_cast<int>(std::floor((e.b - b_min) / b_step));
+            double th = std::fmod(e.theta, M_PI);
+            if (th < 0.0) th += M_PI;
+            int thb = static_cast<int>(std::floor(th / theta_step_rad));
+            if (thb >= th_bins) thb = th_bins - 1;
+
+            if (!(0 <= cxb && cxb < cx_bins && 0 <= cyb && cyb < cy_bins &&
+                  0 <= ab && ab < a_bins && 0 <= bb && bb < b_bins && 0 <= thb && thb < th_bins)) {
+                continue;
+            }
+
+            lcx[cxb] += inl_cnt;
+            lcy[cyb] += inl_cnt;
+            la[ab] += inl_cnt;
+            lb[bb] += inl_cnt;
+            lth[thb] += inl_cnt;
+            local_trials_done[tid] = t;
+        }
+    }
+
+    for (int tid = 0; tid < nthreads; ++tid) {
+        merge_histograms(local_Hcx[tid], Hcx);
+        merge_histograms(local_Hcy[tid], Hcy);
+        merge_histograms(local_Ha[tid], Ha);
+        merge_histograms(local_Hb[tid], Hb);
+        merge_histograms(local_Hth[tid], Hth);
+        if (local_best_inliers[tid] > best_inliers) {
+            best_inliers = local_best_inliers[tid];
+            best_candidate = local_best[tid];
+        }
+        trials_done = std::max(trials_done, local_trials_done[tid]);
+    }
+#else
+    std::mt19937 rng(123);
     for (int t = 1; t <= max_trials; ++t) {
         if (seg_pts.size() < 4) break;
         std::vector<int> indices(seg_pts.size());
@@ -653,32 +750,14 @@ static std::pair<std::optional<EllipseParams>, DetectOneInfo> dght_detect_one_el
             continue;
         }
 
-        int w = inl_cnt;
-        Hcx[cxb] += w;
-        Hcy[cyb] += w;
-        Ha[ab] += w;
-        Hb[bb] += w;
-        Hth[thb] += w;
+        Hcx[cxb] += inl_cnt;
+        Hcy[cyb] += inl_cnt;
+        Ha[ab] += inl_cnt;
+        Hb[bb] += inl_cnt;
+        Hth[thb] += inl_cnt;
         trials_done = t;
-
-        if ((t % check_every) == 0) {
-            auto argmax = [](const std::vector<int>& v) {
-                return static_cast<int>(std::distance(v.begin(), std::max_element(v.begin(), v.end())));
-            };
-            int mcx = argmax(Hcx), mcy = argmax(Hcy), ma = argmax(Ha), mb = argmax(Hb), mth = argmax(Hth);
-            std::array<int, 5> modes = {mcx, mcy, ma, mb, mth};
-            std::array<int, 5> vals = {Hcx[mcx], Hcy[mcy], Ha[ma], Hb[mb], Hth[mth]};
-
-            bool strong = std::all_of(vals.begin(), vals.end(), [&](int v) { return v >= min_votes_mode; });
-            if (strong && last_modes && *last_modes == modes) {
-                stable += 1;
-            } else {
-                stable = 0;
-                last_modes = modes;
-            }
-            if (stable >= stable_checks_needed) break;
-        }
     }
+#endif
 
     auto elapsed = std::chrono::duration<double>(clock::now() - t0).count();
     if (!best_candidate || best_inliers < min_inliers_accept) {
@@ -938,7 +1017,7 @@ int main(int argc, char** argv) {
 #else
         std::cout << "[INFO] OpenMP not enabled at compile time. Build with -fopenmp for parallel execution.\n";
 #endif
-        std::cout << "[INFO] Parallel mode: COMBINED (image loop + voting)\n";
+        std::cout << "[INFO] Parallel mode: one image at a time, internal trial/voting stage parallelized\n";
         std::cout << "[INFO] Method: DGHT-style 1D projected accumulators (weighted by inliers) + peeling\n";
         std::cout << "[INFO] boundary_tol=" << args.boundary_tol << ", max_ellipses=" << args.max_ellipses << "\n";
         std::cout << "[INFO] Saving per-image results to: " << args.out_csv << "\n";
@@ -966,11 +1045,8 @@ int main(int argc, char** argv) {
 
         auto t_batch0 = std::chrono::steady_clock::now();
 
-        // Best first-level parallelization: images are independent.
-        // Each thread processes one image at a time and writes only to row_slots[idx].
-        // This avoids races in the stochastic DGHT/voting/peeling logic.
-        // CHANGE THIS LINE only if you want another OpenMP schedule.
-#pragma omp parallel for schedule(dynamic)
+        // One image is processed at a time. The detector itself now uses OpenMP
+        // only inside the per-image candidate search / histogram voting stage.
         for (int idx = 0; idx < static_cast<int>(image_ids.size()); ++idx) {
             int img_id = image_ids[idx];
             std::string img_path = (fs::path(args.ellipses_dir) / ("id_" + std::to_string(img_id) + ".png")).string();
